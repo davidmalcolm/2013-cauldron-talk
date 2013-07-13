@@ -1,0 +1,386 @@
+Removal of Global State from GCC
+================================
+
+
+Removal of Global State from GCC
+--------------------------------
+
+A proposal for major internal changes (for GCC 4.9)
+
+This is just a summary.
+
+See http://gcc.gnu.org/ml/gcc/2013-06/msg00215.html 
+for the extended version.
+
+Why?
+----
+
+Support embedding GCC as a shared library
+
+* thread-safe: the state of each GCC instance within the process is
+  completely independent of each other GCC instance.
+
+* Just-In-Time compilation (JIT)
+** language runtimes (Python, Ruby, Java, etc)
+** spam filters
+** OpenGL shaders
+** etc.
+
+* Static code analysis
+
+* Documentation generators
+
+* etc
+
+
+Non-plans
+---------
+
+* Outwardly-visible behavior changes
+
+* Changing the license
+
+* Changes to requirements of classic "monolithic binaries" use-case
+** e.g. needing LTO
+** e.g. needing TLS
+
+* Changes to (measurable) performance of said use-case
+
+
+What else would we need to support JIT-compilation?
+---------------------------------------------------
+
+The following are out-of-scope of my state-removal plan:
+
+* Providing an API with an ABI that can have useful stability guarantee
+* Generating actual machine code rather than just assembler
+  (e.g. embedding of binutils)
+* Picking an appropriate subset of passes for JIT
+* Providing an example for people to follow.
+
+
+Scale of Problem
+----------------
+
+* 3500 global variables
+* 100000 sites in the code directly using them
+
+
+High-level Summary
+------------------
+
+* Multiple "parallel universes" of state within one GCC process
+
+* Move all global variables and functions into classes
+** these classes will be "singletons" in the normal build
+** they will have multiple instances in a shared library build
+
+* Minimal disturbance to existing code: "just add classes" (minimizing
+  merger risks and ability to grok the project history)
+
+* Various tricks to:
+** maintain the performance of the standard "monolithic binaries" use case
+** minimize the patching and backporting pain relative to older GCC source trees
+
+
+"Universe" vs "context"
+-----------------------
+
+   class universe
+   {
+   public:
+       /* Instance of the garbage collector.  */
+       gc_heap *heap_;
+       ...
+       /* Instance of the callgraph.  */
+       callgraph *cgraph_;
+       ...
+       /* Pass management.  */
+       pipeline *passes_;
+       ...
+       /* Important objects.  */
+       struct gcc_options global_options_;
+       frontend *frontend_;
+       backend *backend_;
+       FILE * dump_file_;
+       int dump_flags_;
+       // etc
+       ...
+       location_t input_location_;
+       ...
+       /* State shared by many passes. */
+       struct df_d *df_;
+       redirect_edge_var_state *edge_vars_;
+       ...
+       /* Passes that have special state-handling needs.  */
+       mudflap_state *mudflap_;
+   }; // class universe
+
+Passes become C++ classes
+-------------------------
+
+  static const pass_data pass_data_vrp =
+  {
+    GIMPLE_PASS, /* type */
+    "vrp", /* name */
+    OPTGROUP_NONE, /* optinfo_flags */
+    true, /* has_gate */
+    true, /* has_execute */
+    TV_TREE_VRP, /* tv_id */
+    PROP_ssa, /* properties_required */
+    0, /* properties_provided */
+    0, /* properties_destroyed */
+    0, /* todo_flags_start */
+    TODO_cleanup_cfg | TODO_update_ssa | TODO_verify_ssa | TODO_verify_flow,               /* todo_flags_finish */
+  };
+
+Passes (2)
+----------
+
+  class pass_vrp : public gimple_opt_pass
+  {
+  public:
+    pass_vrp(universe &uni)
+      : gimple_opt_pass(pass_data_vrp, uni)
+    {}
+    /* opt_pass methods: */
+    opt_pass * clone () { return new pass_vrp (uni_); }
+    bool gate () { return gate_vrp (); }
+    unsigned int execute () { return execute_vrp (); }
+  }; // class pass_vrp
+  
+  gimple_opt_pass *
+  make_pass_vrp (universe &uni)
+  {
+    return new pass_vrp (uni);
+  }
+
+
+Pass state
+----------
+Various types of per-pass state, which can be moved:
+
+* onto the stack
+* inside the pass instance
+* in a private object shared by all instances of a pass
+* in a semi-private object "owned" by the universe
+
+
+Which universe am I in?
+-----------------------
+* Passes become C++ classes, with a ref back to their universe (usable
+  from execute hook)
+
+* a "universe *" is also available in thread-local store, for use
+  in macros:
+
+  #if SHARED_BUILD
+     extern __thread universe *uni_ptr;
+  #else
+     extern universe g;
+  #endif
+
+  /* Macro for getting a (universe &) */
+  #if SHARED_BUILD
+    /* Read a thread-local pointer: */
+    #define GET_UNIVERSE()  (*uni_ptr)
+  #else
+    /* Access the global singleton: */
+    #define GET_UNIVERSE()  (g)
+  #endif
+
+
+Minimizing merge pain vs "doing it properly"
+--------------------------------------------
+
+Consider:
+
+  #define timevar_push(TV)  GET_UNIVERSE().timevars_->push (TV)
+  #define timevar_pop(TV)   GET_UNIVERSE().timevars_->pop (TV)
+  #define timevar_start(TV) GET_UNIVERSE().timevars_->start (TV)
+  #define timevar_stop(TV)  GET_UNIVERSE().timevars_->stop (TV)
+
+vs a patch that touches all 200+ sites that use the timevar API:
+
+   void
+   jump_labels::
+   rebuild_jump_labels_1 (rtx f, bool count_forced)
+   {
+     rtx insn;
+  -  timevar_push (TV_REBUILD_JUMP);
+  +  uni_.timevar_push (TV_REBUILD_JUMP);
+     init_label_info (f);
+
+The universe sits below GTY/GGC
+-------------------------------
+
+* Each universe gets its own GC heap
+** Needs special-case handling as its own root (not a pointer).
+** Gradually becomes the only root, as global GTY roots are removed.
+
+Status:
+
+* I have this working for GC
+* Not yet working with PCH (but I think this is doable)
+
+* Assumption: the universe instance is the single thing that:
+** can own refs on GC objects AND
+** isn't itself in the GC heap
+
+
+Performance
+-----------
+
+* I won't be adding fields to any major types, so memory usage shouldn't
+  noticably change.
+
+* We know there'll be a hit of a few % for adding -fPIC/-fpic (so this will
+  be a configure-time opt-in).
+
+* We can't yet know what the impact of passing around context will
+  be (register pressure etc).
+
+* How expensive is TLS on various archs?
+
+
+What should my benchmark suite look like?
+-----------------------------------------
+
+Benchmark 1: compile time of Linux kernel
+
+Benchmark 2: building Firefox with LTO
+
+I have a systemtap script to watch all process invocation, gathering various
+timings, so we can track per-TU timings "from outside".
+
+
+Ways of avoiding performance hit
+--------------------------------
+
+* Configure-time opt-in to shared library
+
+* Ways of eliminating context pointers
+
+
+Eliminating context ptrs (1)
+----------------------------
+
+  #if GLOBAL_STATE
+  /* When using global state, all methods and fields of state classes
+     become "static", so that there is effectively a single global
+     instance of the state, and there is no implicit "this->" being passed
+     around.  */
+  # define MAYBE_STATIC static
+  #else
+  /* When using on-stack state, all methods and fields of state classes
+     lose the "static", so that there can be multiple instances of the
+     state with an implicit "this->" everywhere the state is used.  */
+  # define MAYBE_STATIC
+  #endif
+
+Example of MAYBE_STATIC
+-----------------------
+
+cgraph.h
+
+   class GTY((user)) callgraph
+   {
+   public:
+      callgraph(universe &uni);
+      MAYBE_STATIC  void dump (FILE *) const;
+      MAYBE_STATIC  void dump_cgraph_node (FILE *, struct cgraph_node *) const;
+      MAYBE_STATIC  void remove_edge (struct cgraph_edge *);
+      MAYBE_STATIC  void remove_node (struct cgraph_node *);
+      MAYBE_STATIC  struct cgraph_edge *
+                    create_edge (struct cgraph_node *,
+                                 struct cgraph_node *,
+                                 gimple, gcov_type, int);
+      /* etc */
+
+
+Eliminating context ptrs (2)
+----------------------------
+
+   #if USING_IMPLICIT_STATIC
+   #define SINGLETON_IN_STATIC_BUILD __attribute__((force_static))
+   #else
+   #define SINGLETON_IN_STATIC_BUILD
+   #endif
+
+   class GTY((user)) SINGLETON_IN_STATIC_BUILD callgraph
+   { 
+   public:
+      callgraph(universe &uni);
+      void dump (FILE *) const;
+      void dump_cgraph_node (FILE *, struct cgraph_node *) const;
+      void remove_edge (struct cgraph_edge *);
+      void remove_node (struct cgraph_node *);
+      struct cgraph_edge *
+      create_edge (struct cgraph_node *,
+                   struct cgraph_node *,
+                   gimple, gcov_type, int);
+      /* etc */
+
+
+Eliminating context ptrs (3)
+----------------------------
+
+   #if USING_SINGLETON_ATTRIBUTE
+   #define SINGLETON_IN_STATIC_BUILD(INSTANCE) \
+      __attribute__((singleton(INSTANCE))
+   #else
+   #define SINGLETON_IN_STATIC_BUILD(INSTANCE)
+   #endif
+
+   #if USING_SINGLETON_ATTRIBUTE
+   class callgraph the_cgraph;
+   #endif
+
+   class GTY((user)) SINGLETON_IN_STATIC_BUILD(the_cgraph) callgraph
+   { 
+   public:
+      callgraph(universe &uni);
+      void dump (FILE *) const;
+      void dump_cgraph_node (FILE *, struct cgraph_node *) const;
+      void remove_edge (struct cgraph_edge *);
+      void remove_node (struct cgraph_node *);
+      struct cgraph_edge *
+      create_edge (struct cgraph_node *,
+                   struct cgraph_node *,
+                   gimple, gcov_type, int);
+      /* etc */
+
+
+Branch management
+-----------------
+Given perf concerns, my thinking is:
+
+* do it on a (git) branch, merging from trunk regularly
+* measure performance relative to 4.8 and to trunk regularly
+* tactical patches to trunk to minimize merger pain
+* when would the merge into trunk need to happen by for 4.9?
+* autogenerate burndown charts measuring # of globals and # of usage sites
+
+
+Fallback plan
+-------------
+Ideal: get rid of all of it during 4.9's schedule
+
+I plan to spend a substantial proportion of $DAYJOB on this.
+
+Fallback plan: introduce a big mutex guarding those that weren't
+eliminated in time.
+
+
+What I'm hoping for from Cauldron
+---------------------------------
+
+* Consensus that this is desirable
+* Consensus that my work could be mergable
+* Branch management plans
+* Performance Guidelines
+
+
+Discussion
+----------
+What nasty problems have I missed?
