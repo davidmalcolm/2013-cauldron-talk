@@ -5,7 +5,7 @@ Removal of Global State from GCC
 Removal of Global State from GCC
 --------------------------------
 
-A proposal for major internal changes (for GCC 4.9)
+A proposal for major internal changes to GCC.
 
 This is just a summary.
 
@@ -358,18 +358,8 @@ Given perf concerns, my thinking is:
 * do it on a (git) branch, merging from trunk regularly
 * measure performance relative to 4.8 and to trunk regularly
 * tactical patches to trunk to minimize merger pain
-* when would the merge into trunk need to happen by for 4.9?
+* when would the merge into trunk need to happen by for 4.9/4.10?
 * autogenerate burndown charts measuring # of globals and # of usage sites
-
-
-Fallback plan
--------------
-Ideal: get rid of all of it during 4.9's schedule
-
-I plan to spend a substantial proportion of $DAYJOB on this.
-
-Fallback plan: introduce a big mutex guarding those that weren't
-eliminated in time.
 
 
 What I'm hoping for from Cauldron
